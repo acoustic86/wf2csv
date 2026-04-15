@@ -29,3 +29,30 @@ One last thing I am not planning on supporting this in any way. Feel free to for
 h3. About me
 
 Check my blog "StakeVentures":http://stakeventures.com and my startup "Agree2":http://agree2.com.
+
+h2. Current Notes and Updated Workflow
+
+These are additional notes for the current version, while keeping all original instructions above intact.
+
+* This now works with both Wells Fargo personal and business credit card PDF statements.
+* Place your statement PDF files into the "statements" directory.
+* Run this command from the project root:
+
+<pre>
+ruby wf2csv.rb --clean
+</pre>
+
+The --clean flag removes previously generated statement .csv/.txt output first, then regenerates fresh files from the PDFs currently in "statements".
+
+h3. Using GitHub Codespaces
+
+You can run this project directly in GitHub Codespaces:
+
+* Open the repository in GitHub.
+* Click Code -> Codespaces -> Create codespace on master.
+* In the Codespaces terminal, add your PDF statements to the "statements" directory.
+* Run:
+
+<pre>
+ruby wf2csv.rb --clean
+</pre>

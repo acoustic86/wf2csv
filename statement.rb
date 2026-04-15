@@ -1,4 +1,5 @@
-require 'pdf_parser'
+require_relative 'pdf_parser'
+require 'csv'
 
 class Statement
   attr_accessor :statement_end_date, :account_number, :ending_balance, :starting_balance, :total_deposits, :total_withdrawals, :deposits, :withdrawals,:content
@@ -12,11 +13,11 @@ class Statement
   
   def initialize(file_name)
     @content=PdfParser.new(file_name).content
-    File.open("#{file_name}.txt",'w') {|f| f<<@content }
-    @year="20"+statement_end_date.split(/\//).last
-    File.open("#{file_name}.csv",'w') do |f|
+    year_part = statement_end_date.split(/\//).last
+    @year = year_part.length == 4 ? year_part : "20" + year_part
+    CSV.open("#{file_name}.csv", 'w') do |csv|
       all.each do |x|
-        f.puts x.join(",")
+        csv << [x[0], payee_from_description(x[1]), x[1], x[2]]
       end
     end
     unless audit?
@@ -29,27 +30,70 @@ class Statement
   end
   
   def statement_end_date
-    @statement_end_date||=find_value(/Statement End Date:\s*(\d\d\/\d\d\/\d\d)/)[0]
+    @statement_end_date ||= begin
+      value = find_value(/Statement End Date:\s*(\d\d\/\d\d\/\d\d)/)
+      value = find_value(/Statement Closing Date\s*(\d\d\/\d\d\/\d\d)/) if value.nil?
+      value = find_value(/Statement Period\s+\d\d\/\d\d\/\d{4}\s+to\s+(\d\d\/\d\d\/\d{4})/) if value.nil?
+      value ? value[0] : nil
+    end
   end
 
   def starting_balance
-    @starting_balance||=to_number(find_value(/#{DATE} BEGINNING BALANCE\s*#{AMOUNT}/)[2])
+    @starting_balance ||= begin
+      legacy = find_value(/#{DATE} BEGINNING BALANCE\s*#{AMOUNT}/)
+      if legacy
+        to_number(legacy[2])
+      else
+        current = find_value(/Previous Balance\s*\$((?:\d{1,3},)*\d+\.\d{2})/)
+        current ? to_number(current[0]) : 0.0
+      end
+    end
   end
 
   def ending_balance
-    @ending_balance||=to_number( find_value(/#{DATE} ENDING BALANCE\s*#{AMOUNT}/)[2])
+    @ending_balance ||= begin
+      legacy = find_value(/#{DATE} ENDING BALANCE\s*#{AMOUNT}/)
+      if legacy
+        to_number(legacy[2])
+      else
+        current = find_value(/New Balance\s*(?:=\s*)?\$((?:\d{1,3},)*\d+\.\d{2})/)
+        current ? to_number(current[0]) : 0.0
+      end
+    end
   end
 
   def account_number
-    @account_number||=find_value(/Account Number:\s*(\d+-?\d+)/)[0]
+    @account_number ||= begin
+      legacy = find_value(/Account Number:\s*(\d+-?\d+)/)
+      if legacy
+        legacy[0]
+      else
+        current = find_value(/Account Number\s*((?:\d{4}\s+){3}\d{4})/)
+        current ? current[0].gsub(/\s+/, '') : nil
+      end
+    end
   end
   
   def total_deposits
-    @total_deposits||=to_number(find_value(/TOTAL DEPOSITS\/CREDITS\s*#{AMOUNT}/)[0])
+    @total_deposits ||= begin
+      legacy = find_value(/TOTAL DEPOSITS\/CREDITS\s*#{AMOUNT}/)
+      if legacy
+        to_number(legacy[0])
+      else
+        calculate_balance(deposits)
+      end
+    end
   end
   
   def total_withdrawals
-    @total_withdrawals||=to_number(find_value(/TOTAL WITHDRAWALS\/DEBITS\s*#{AMOUNT}/)[0])
+    @total_withdrawals ||= begin
+      legacy = find_value(/TOTAL WITHDRAWALS\/DEBITS\s*#{AMOUNT}/)
+      if legacy
+        to_number(legacy[0])
+      else
+        calculate_balance(withdrawals)
+      end
+    end
   end
   
   
@@ -82,11 +126,27 @@ class Statement
   end
   
   def deposits
-    @deposits||=transactions(deposits_section)
+    @deposits ||= begin
+      if legacy_format?
+        transactions(deposits_section)
+      else
+        transactions_from_details.select { |x| x[:credit] && x[:credit] > 0 }.collect do |x|
+          [format_date(x[:post_date]), x[:description], x[:credit]]
+        end
+      end
+    end
   end
   
   def withdrawals
-    @withdrawals||=transactions(withdrawals_section)+checks
+    @withdrawals ||= begin
+      if legacy_format?
+        transactions(withdrawals_section)+checks
+      else
+        transactions_from_details.select { |x| x[:charge] && x[:charge] > 0 }.collect do |x|
+          [format_date(x[:post_date]), x[:description], -x[:charge]]
+        end
+      end
+    end
   end
   
   def checks
@@ -153,7 +213,12 @@ class Statement
   end
   
   def format_date(d)
-    (d.split + [@year]).join('-')
+    if d =~ /\A\d\d\/\d\d\z/
+      month, day = d.split('/')
+      [month, day, @year].join('-')
+    else
+      (d.split + [@year]).join('-')
+    end
   end
   
   def to_hash
@@ -171,5 +236,74 @@ class Statement
   
   def find_value(regex)
     search(regex).first
+  end
+
+  def legacy_format?
+    !!find_value(/Statement End Date:\s*(\d\d\/\d\d\/\d\d)/)
+  end
+
+  def transaction_details_section
+    @transaction_details_section ||= begin
+      start = @content.index("Transaction Details") || @content.index("Transactions")
+      return "" if start.nil?
+
+      stop = @content.index("TOTAL *FINANCE CHARGE*", start) ||
+             @content.index("Interest Charge Calculation", start) ||
+             @content.length
+      @content[start, stop - start]
+    end
+  end
+
+  def transactions_from_details
+    @transactions_from_details ||= begin
+      rows = []
+      transaction_details_section.each_line do |line|
+        finance_match = line.match(/^\s*PERIODIC \*FINANCE CHARGE\*\s+PURCHASES\s+\$((?:\d{1,3},)*\d+\.\d{2})\s+CASH ADVANCE\s+\$((?:\d{1,3},)*\d+\.\d{2})\s+((?:\d{1,3},)*\d+\.\d{2})\s*$/)
+        unless finance_match.nil?
+          statement_month_day = statement_end_date[0, 5]
+          description = "PERIODIC *FINANCE CHARGE* PURCHASES $#{finance_match[1]} CASH ADVANCE $#{finance_match[2]}"
+          rows << { post_date: statement_month_day, description: description, credit: nil, charge: to_number(finance_match[3]) }
+          next
+        end
+
+        # Current WF layout: [card last 4 (optional)] trans date, post date, reference id, description, credits(optional), charges(optional)
+        match = line.match(/^\s*(?:\d{4}\s+)?(\d\d\/\d\d)\s+(\d\d\/\d\d)\s+\S+\s+(.*?)\s{2,}((?:(?:\d{1,3},)*\d+\.\d{2})(?:\s+(?:\d{1,3},)*\d+\.\d{2})?)\s*$/)
+        next if match.nil?
+
+        description = match[3].gsub(/\s+/, ' ').strip
+        amounts = match[4].scan(/(?:\d{1,3},)*\d+\.\d{2}/)
+        credit = nil
+        charge = nil
+        if amounts.size == 2
+          credit = to_number(amounts[0])
+          charge = to_number(amounts[1])
+        elsif amounts.size == 1
+          value = to_number(amounts[0])
+          if credit_like_description?(description)
+            credit = value
+          else
+            charge = value
+          end
+        end
+
+        rows << { post_date: match[2], description: description, credit: credit, charge: charge }
+      end
+      rows
+    end
+  end
+
+  def credit_like_description?(description)
+    description =~ /(PAYMENT|CREDIT|REFUND|REVERSAL|THANK YOU)/i
+  end
+
+  def payee_from_description(description)
+    normalized = description.to_s.strip
+    return '' if normalized.empty?
+
+    first_token = normalized.split(/\s+/).first
+    payee = first_token[/\A[0-9A-Za-z]+/]
+    return payee unless payee.nil? || payee.empty?
+
+    normalized[/[0-9A-Za-z]+/] || ''
   end
 end
