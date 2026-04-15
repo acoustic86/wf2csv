@@ -26,9 +26,6 @@ h3. Need help?
 
 One last thing I am not planning on supporting this in any way. Feel free to fork it and work on it though.
 
-h3. About me
-
-Check my blog "StakeVentures":http://stakeventures.com and my startup "Agree2":http://agree2.com.
 
 h2. Current Notes and Updated Workflow
 
